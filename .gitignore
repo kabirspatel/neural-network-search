@@ -19,3 +19,6 @@ raw/
 
 *.zip
 
+.DS_Store
+data/
+etl/
