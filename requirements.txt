@@ -1,5 +1,5 @@
 # requirements.txt for biomarkersearch app
-neo4j==5.23.1
+neo4j==5.14.0
+streamlit==1.26.0
 pyvis==0.3.2
 pandas
-python-dotenv
