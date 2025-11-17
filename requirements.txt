@@ -1,6 +1,5 @@
-streamlit==1.38.0
-neo4j==5.23.0
-pandas==2.2.2
+# requirements.txt for biomarkersearch app
+neo4j==5.23.1
 pyvis==0.3.2
-python-dotenv==1.0.1
-requests==2.32.3
+pandas
+python-dotenv
