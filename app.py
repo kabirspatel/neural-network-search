@@ -1,322 +1,265 @@
-import os
-from pathlib import Path
-import tempfile
+kimport os
+from typing import List, Dict, Any
 
 import streamlit as st
-import streamlit.components.v1 as components
 from neo4j import GraphDatabase
-from pyvis.network import Network
+import graphviz
 
+# ---------------------------------------------------------------------
+# Neo4j connection
+# ---------------------------------------------------------------------
 
-# ---------- Neo4j connection ----------
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER", "neo4j")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
 
 @st.cache_resource
 def get_driver():
-    uri = os.getenv("NEO4J_URI")
-    user = os.getenv("NEO4J_USER", "neo4j")
-    password = os.getenv("NEO4J_PASSWORD")
+    if not NEO4J_URI or not NEO4J_PASSWORD:
+        raise RuntimeError("NEO4J_URI or NEO4J_PASSWORD is not set in environment.")
+    return GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
-    if not uri or not password:
-        raise RuntimeError(
-            "Missing Neo4j connection details. "
-            "Set NEO4J_URI / NEO4J_PASSWORD in your environment or Streamlit secrets."
+driver = get_driver()
+
+def run_cypher(query: str, params: Dict[str, Any] = None) -> List[Dict[str, Any]]:
+    with driver.session() as session:
+        result = session.run(query, params or {})
+        return [r.data() for r in result]
+
+# ---------------------------------------------------------------------
+# Cypher queries
+# ---------------------------------------------------------------------
+
+BIOMARKER_SEARCH_QUERY = """
+// Full-text style biomarker search with counts of neighbors
+WITH toLower($q) AS q
+MATCH (b:Biomarker)
+WHERE q IS NULL OR q = '' OR toLower(b.name) CONTAINS q
+OPTIONAL MATCH (d:Device)-[:MEASURES]->(b)
+OPTIONAL MATCH (b)-[:ASSOCIATED_WITH]->(di:Disease)
+OPTIONAL MATCH (b)-[:MEASURED_IN]->(s:Specimen)
+OPTIONAL MATCH (b)-[:USES_METHOD]->(m:Method)
+WITH b,
+     count(DISTINCT d)  AS device_count,
+     count(DISTINCT di) AS disease_count,
+     count(DISTINCT s)  AS specimen_count,
+     count(DISTINCT m)  AS method_count
+RETURN
+  elementId(b)          AS biomarker_id,
+  b.name                AS biomarker,
+  1.0                   AS score,           // placeholder score
+  device_count          AS devices,
+  disease_count         AS diseases,
+  specimen_count        AS specimens,
+  method_count          AS methods
+ORDER BY score DESC, biomarker
+LIMIT $limit;
+"""
+
+NEIGHBORHOOD_QUERY = """
+// Return a small neighborhood around a set of biomarker IDs
+WITH $biomarker_ids AS ids
+
+// Devices -> Biomarkers
+MATCH (d:Device)-[:MEASURES]->(b:Biomarker)
+WHERE elementId(b) IN ids
+WITH ids,
+     collect({
+       src_id: elementId(d),
+       src_label: 'Device',
+       src_name: coalesce(d.device_name, d.generic_name),
+       dst_id: elementId(b),
+       dst_label: 'Biomarker',
+       dst_name: b.name,
+       rel_type: 'MEASURES'
+     }) AS dev_edges
+
+// Biomarkers -> Diseases
+MATCH (b:Biomarker)-[:ASSOCIATED_WITH]->(di:Disease)
+WHERE elementId(b) IN ids
+WITH ids, dev_edges,
+     collect({
+       src_id: elementId(b),
+       src_label: 'Biomarker',
+       src_name: b.name,
+       dst_id: elementId(di),
+       dst_label: 'Disease',
+       dst_name: di.name,
+       rel_type: 'ASSOCIATED_WITH'
+     }) AS dis_edges
+
+// Biomarkers -> Specimens
+MATCH (b:Biomarker)-[:MEASURED_IN]->(s:Specimen)
+WHERE elementId(b) IN ids
+WITH ids, dev_edges, dis_edges,
+     collect({
+       src_id: elementId(b),
+       src_label: 'Biomarker',
+       src_name: b.name,
+       dst_id: elementId(s),
+       dst_label: 'Specimen',
+       dst_name: s.name,
+       rel_type: 'MEASURED_IN'
+     }) AS spec_edges
+
+// Biomarkers -> Methods
+MATCH (b:Biomarker)-[:USES_METHOD]->(m:Method)
+WHERE elementId(b) IN ids
+WITH
+  dev_edges + dis_edges + spec_edges +
+  collect({
+    src_id: elementId(b),
+    src_label: 'Biomarker',
+    src_name: b.name,
+    dst_id: elementId(m),
+    dst_label: 'Method',
+    dst_name: m.name,
+    rel_type: 'USES_METHOD'
+  }) AS all_edges
+
+UNWIND all_edges AS e
+RETURN DISTINCT e;
+"""
+
+# ---------------------------------------------------------------------
+# Graph building (Graphviz)
+# ---------------------------------------------------------------------
+
+NODE_STYLE = {
+    "Biomarker": {"color": "#1f77b4", "shape": "ellipse"},
+    "Device":    {"color": "#2ca02c", "shape": "box"},
+    "Disease":   {"color": "#d62728", "shape": "diamond"},
+    "Specimen":  {"color": "#9467bd", "shape": "oval"},
+    "Method":    {"color": "#ff7f0e", "shape": "hexagon"},
+}
+
+def build_graphviz(edges: List[Dict[str, Any]]) -> graphviz.Graph:
+    """
+    Build a Graphviz graph from edge rows of NEIGHBORHOOD_QUERY.
+    Each edge row has: src_id, src_label, src_name, dst_id, dst_label, dst_name, rel_type
+    """
+    if not edges:
+        return None
+
+    dot = graphviz.Digraph(engine="dot")
+    dot.attr("graph", bgcolor="transparent")
+
+    nodes: Dict[str, Dict[str, str]] = {}
+
+    for e in edges:
+        # Register source node
+        sid = e["e"]["src_id"]
+        if sid not in nodes:
+            nodes[sid] = {
+                "label": e["e"]["src_label"],
+                "name":  e["e"]["src_name"],
+            }
+
+        # Register destination node
+        did = e["e"]["dst_id"]
+        if did not in nodes:
+            nodes[did] = {
+                "label": e["e"]["dst_label"],
+                "name":  e["e"]["dst_name"],
+            }
+
+    # Add nodes with styling
+    for nid, info in nodes.items():
+        label = info["label"]
+        name = info["name"] or "(unknown)"
+        style = NODE_STYLE.get(label, {"color": "#7f7f7f", "shape": "ellipse"})
+        dot.node(
+            nid,
+            f"{name}\n({label})",
+            style="filled",
+            color=style["color"],
+            shape=style["shape"],
+            fontname="Helvetica",
         )
 
-    return GraphDatabase.driver(uri, auth=(user, password))
+    # Add edges
+    for e in edges:
+        sid = e["e"]["src_id"]
+        did = e["e"]["dst_id"]
+        rel = e["e"]["rel_type"]
+        dot.edge(sid, did, label=rel, fontname="Helvetica", fontsize="10")
 
+    return dot
 
-# ---------- Queries ----------
+# ---------------------------------------------------------------------
+# Streamlit UI
+# ---------------------------------------------------------------------
 
-def run_table_query(driver, query_text, specimen_filter, method_filter, max_rows):
-    """
-    Return top biomarkers for the table, with counts of linked devices,
-    diseases, specimens and methods.
-    """
-    cypher = """
-    CALL db.index.fulltext.queryNodes('biomarkerNameIndex', $q)
-        YIELD node, score
-    WITH node, score
-    // specimen filter using specimen_list text
-    WHERE ($specimen IS NULL OR $specimen = '' OR
-           (node.specimen_list IS NOT NULL AND
-            toLower(node.specimen_list) CONTAINS toLower($specimen)))
-
-    // pre-collect methods for optional method filter
-    OPTIONAL MATCH (node)<-[:USES_METHOD]-(m:Method)
-    WITH node, score, collect(DISTINCT m) AS methods
-    WHERE ($method IS NULL OR $method = '' OR
-           any(mm IN methods WHERE toLower(mm.name) CONTAINS toLower($method)))
-
-    // collect devices
-    OPTIONAL MATCH (node)<-[:MEASURES]-(d:Device)
-    WITH node, score,
-         methods,
-         collect(DISTINCT d) AS devices
-
-    WITH node, score,
-         size(devices) AS device_count,
-         size(methods) AS method_count,
-         CASE
-           WHEN node.disease_list IS NULL THEN 0
-           ELSE size([x IN split(node.disease_list, ';') WHERE trim(x) <> ''])
-         END AS disease_count,
-         CASE
-           WHEN node.specimen_list IS NULL THEN 0
-           ELSE size([x IN split(node.specimen_list, ';') WHERE trim(x) <> ''])
-         END AS specimen_count
-
-    RETURN
-        elementId(node)      AS biomarker_id,
-        node.name            AS biomarker,
-        round(score, 3)      AS score,
-        device_count         AS devices,
-        disease_count        AS diseases,
-        specimen_count       AS specimens,
-        method_count         AS methods
-    ORDER BY score DESC
-    LIMIT $limit
-    """
-
-    params = {
-        "q": query_text,
-        "specimen": specimen_filter or "",
-        "method": method_filter or "",
-        "limit": int(max_rows),
-    }
-
-    with driver.session() as session:
-        records = session.run(cypher, **params)
-        return [r.data() for r in records]
-
-
-def run_graph_query(driver, query_text, specimen_filter, method_filter, max_biomarkers):
-    """
-    Return biomarker + connected device / disease / specimen / method names
-    for building the network graph.
-    """
-    cypher = """
-    CALL db.index.fulltext.queryNodes('biomarkerNameIndex', $q)
-        YIELD node, score
-    WITH node, score
-    WHERE ($specimen IS NULL OR $specimen = '' OR
-           (node.specimen_list IS NOT NULL AND
-            toLower(node.specimen_list) CONTAINS toLower($specimen)))
-
-    OPTIONAL MATCH (node)<-[:USES_METHOD]-(m:Method)
-    WITH node, score, collect(DISTINCT m) AS methods
-    WHERE ($method IS NULL OR $method = '' OR
-           any(mm IN methods WHERE toLower(mm.name) CONTAINS toLower($method)))
-
-    OPTIONAL MATCH (node)<-[:MEASURES]-(d:Device)
-    WITH node, score,
-         methods,
-         collect(DISTINCT d) AS devices,
-         CASE
-           WHEN node.disease_list IS NULL THEN []
-           ELSE [x IN split(node.disease_list, ';') WHERE trim(x) <> '']
-         END AS diseases,
-         CASE
-           WHEN node.specimen_list IS NULL THEN []
-           ELSE [x IN split(node.specimen_list, ';') WHERE trim(x) <> '']
-         END AS specimens
-
-    RETURN
-        elementId(node) AS biomarker_id,
-        node.name       AS biomarker,
-        diseases,
-        specimens,
-        [d IN devices | coalesce(d.device_name, d.generic_name, '(unnamed device)')] AS devices,
-        [m IN methods | m.name] AS methods
-    ORDER BY score DESC
-    LIMIT $limit
-    """
-
-    params = {
-        "q": query_text,
-        "specimen": specimen_filter or "",
-        "method": method_filter or "",
-        "limit": int(max_biomarkers),
-    }
-
-    with driver.session() as session:
-        records = session.run(cypher, **params)
-        return [r.data() for r in records]
-
-
-# ---------- Graph building (PyVis) ----------
-
-def build_network(graph_rows):
-    """
-    Build a PyVis network from the rows returned by run_graph_query.
-    Nodes are created on-the-fly (we do not rely on Neo4j element_id anymore).
-    """
-    net = Network(height="600px", width="100%", bgcolor="#111111", font_color="white")
-    net.barnes_hut()
-
-    added_nodes = set()
-
-    for row in graph_rows:
-        biomarker_label = row.get("biomarker") or "Unnamed biomarker"
-        biomarker_key = f"b|{row.get('biomarker_id', biomarker_label)}"
-
-        if biomarker_key not in added_nodes:
-            net.add_node(
-                biomarker_key,
-                label=biomarker_label,
-                color="#00d1ff",
-                title=f"Biomarker: {biomarker_label}",
-            )
-            added_nodes.add(biomarker_key)
-
-        # Diseases
-        for disease in row.get("diseases", []) or []:
-            disease = disease.strip()
-            if not disease:
-                continue
-            node_id = f"d|{disease}"
-            if node_id not in added_nodes:
-                net.add_node(
-                    node_id,
-                    label=disease,
-                    color="#ff6b6b",
-                    title=f"Disease: {disease}",
-                )
-                added_nodes.add(node_id)
-            net.add_edge(biomarker_key, node_id)
-
-        # Specimens / biofluids
-        for specimen in row.get("specimens", []) or []:
-            specimen = specimen.strip()
-            if not specimen:
-                continue
-            node_id = f"s|{specimen}"
-            if node_id not in added_nodes:
-                net.add_node(
-                    node_id,
-                    label=specimen,
-                    color="#feca57",
-                    title=f"Specimen / biofluid: {specimen}",
-                )
-                added_nodes.add(node_id)
-            net.add_edge(biomarker_key, node_id)
-
-        # Devices
-        for device in row.get("devices", []) or []:
-            device = device.strip()
-            if not device:
-                continue
-            node_id = f"v|{device}"
-            if node_id not in added_nodes:
-                net.add_node(
-                    node_id,
-                    label=device,
-                    color="#1dd1a1",
-                    title=f"Device: {device}",
-                )
-                added_nodes.add(node_id)
-            net.add_edge(biomarker_key, node_id)
-
-        # Methods
-        for method in row.get("methods", []) or []:
-            method = method.strip()
-            if not method:
-                continue
-            node_id = f"m|{method}"
-            if node_id not in added_nodes:
-                net.add_node(
-                    node_id,
-                    label=method,
-                    color="#5f27cd",
-                    title=f"Detection method: {method}",
-                )
-                added_nodes.add(node_id)
-            net.add_edge(biomarker_key, node_id)
-
-    # Save HTML to a temp file
-    tmp_dir = Path(tempfile.gettempdir())
-    html_path = tmp_dir / "biomarker_network.html"
-    net.show(str(html_path))
-    return html_path
-
-
-# ---------- Streamlit UI ----------
-
-st.set_page_config(
-    page_title="Biomarker / Disease / Method Search",
-    layout="wide",
-)
+st.set_page_config(page_title="Biomarker / Disease / Method Search", layout="wide")
 
 st.title("Biomarker / Disease / Method Search")
 st.write(
     "Search across your **biomarkers**, linked **diseases**, **devices**, "
-    "**specimens (biofluids)** and **detection methods** from the Neo4j Aura graph."
+    "**specimens** (biofluids) and **detection methods** from the Neo4j Aura graph."
 )
-
-driver = get_driver()
 
 with st.sidebar:
     st.header("Search settings")
-    biomarker_query = st.text_input(
-        "Search by biomarker name or keyword",
-        value="BRCA1",
-        help="Full-text search over biomarker names.",
-    )
-    specimen_filter = st.text_input(
-        "Specimen filter (optional)",
-        value="",
-        help="Filter using text in the biomarker's specimen_list (e.g., urine, blood).",
-    )
-    method_filter = st.text_input(
-        "Method filter (optional)",
-        value="",
-        help="Filter biomarkers that are linked to methods matching this text.",
-    )
-    max_table_rows = st.slider("Max table rows", 10, 200, 50, step=10)
-    max_graph_biomarkers = st.slider("Max graph biomarkers", 5, 80, 40, step=5)
 
-    run_button = st.button("Run search")
+    query = st.text_input("Search by biomarker name or keyword", value="BRCA1")
 
-if run_button and biomarker_query.strip():
-    try:
-        # ----- Table -----
-        table_rows = run_table_query(
-            driver,
-            biomarker_query.strip(),
-            specimen_filter.strip(),
-            method_filter.strip(),
-            max_table_rows,
-        )
+    specimen_filter = st.text_input("Specimen filter (optional)", placeholder="e.g., urine, blood")
+    method_filter = st.text_input("Method filter (optional)", placeholder="e.g., colorimetric assay")
 
-        st.subheader("Tabular results")
-        if table_rows:
-            st.dataframe(table_rows, use_container_width=True)
+    max_rows = st.slider("Max table rows", min_value=10, max_value=200, value=50, step=10)
+    max_graph_biomarkers = st.slider("Max graph biomarkers", min_value=5, max_value=80, value=40, step=5)
+
+    run_search = st.button("Run search")
+
+if run_search:
+    # -----------------------------------------------------------------
+    # 1. Tabular biomarker search
+    # -----------------------------------------------------------------
+    params = {"q": query.strip(), "limit": max_rows}
+    biomarker_rows = run_cypher(BIOMARKER_SEARCH_QUERY, params)
+
+    st.subheader("Tabular results")
+
+    if not biomarker_rows:
+        st.warning("No biomarkers matched your query/filters.")
+    else:
+        # Simple specimen/method filtering on name text (post-query)
+        if specimen_filter:
+            sf = specimen_filter.lower()
+            biomarker_rows = [r for r in biomarker_rows if sf in (r["biomarker"] or "").lower()]
+
+        if method_filter:
+            mf = method_filter.lower()
+            biomarker_rows = [r for r in biomarker_rows if mf in (r["biomarker"] or "").lower()]
+
+        if not biomarker_rows:
+            st.warning("No biomarkers remained after applying text filters.")
         else:
-            st.warning("No biomarkers matched your query/filters.")
+            # Show table
+            st.dataframe(biomarker_rows, use_container_width=True)
 
-        # ----- Graph -----
-        st.subheader("Network view")
+    # -----------------------------------------------------------------
+    # 2. Network view (Graphviz)
+    # -----------------------------------------------------------------
+    st.subheader("Network view")
 
-        graph_rows = run_graph_query(
-            driver,
-            biomarker_query.strip(),
-            specimen_filter.strip(),
-            method_filter.strip(),
-            max_graph_biomarkers,
-        )
+    if not biomarker_rows:
+        st.info("No graph neighborhood available for this query with current filters.")
+    else:
+        # Take the top N biomarkers by score and pass their IDs
+        selected_ids = [row["biomarker_id"] for row in biomarker_rows[:max_graph_biomarkers]]
 
-        if not graph_rows:
+        neigh_edges = run_cypher(NEIGHBORHOOD_QUERY, {"biomarker_ids": selected_ids})
+
+        if not neigh_edges:
             st.info("No graph neighborhood available for this query with current filters.")
         else:
-            try:
-                html_path = build_network(graph_rows)
-                with open(html_path, "r", encoding="utf-8") as f:
-                    html = f.read()
-                components.html(html, height=650, scrolling=True)
-            except Exception as e:
-                st.error(f"Graph rendering error: {e}")
-
-    except Exception as e:
-        st.error(f"Search error: {e}")
+            dot = build_graphviz(neigh_edges)
+            if dot is None:
+                st.info("No graph neighborhood available for this query with current filters.")
+            else:
+                st.graphviz_chart(dot, use_container_width=True)
 
 else:
-    st.info("Enter a biomarker keyword and click **Run search** to begin.")
+    st.info("Enter a biomarker keyword (e.g., *BRCA1*) and click **Run search**.")
+
