@@ -22,3 +22,4 @@ raw/
 .DS_Store
 data/
 etl/
+.streamlit/secrets.toml
