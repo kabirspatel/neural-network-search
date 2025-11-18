@@ -1,12 +1,10 @@
+# Core app
 streamlit==1.38.0
-pandas==2.2.2
-pyvis==0.3.2
-networkx==3.2.1
-neo4j==5.23.0
-python-dotenv==1.0.1
+pandas>=2.2
+networkx>=3.0
+pyvis>=0.3.2
+neo4j>=5.23
+python-dotenv>=1.0
 
-# Pinned Streamlit dependencies (to prevent uninstall loops)
-markdown-it-py==3.0.0
-mdurl==0.1.2
-pygments==2.19.1
-rich==13.7.1
+# (Optional) only if you still use matplotlib anywhere; otherwise delete this line
+# matplotlib>=3.8
