@@ -1,377 +1,252 @@
-import os
-from typing import List, Dict, Any
-
 import streamlit as st
-import streamlit.components.v1 as components
 from neo4j import GraphDatabase
-from pyvis.network import Network
 import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
 
-# -------------------------------------------------------------------
+
+# ----------------------------
 # Neo4j connection
-# -------------------------------------------------------------------
-
+# ----------------------------
 
 @st.cache_resource
 def get_driver():
-    """
-    Create and cache a Neo4j driver.
-    Reads credentials from Streamlit secrets (preferred) or env vars.
-    """
-    # Prefer Streamlit secrets, fall back to environment variables
-    secrets = getattr(st, "secrets", {})
-    uri = secrets.get("NEO4J_URI", os.getenv("NEO4J_URI"))
-    user = secrets.get("NEO4J_USER", os.getenv("NEO4J_USER"))
-    password = secrets.get("NEO4J_PASSWORD", os.getenv("NEO4J_PASSWORD"))
-
-    if not uri or not user or not password:
-        raise RuntimeError(
-            "Neo4j connection info not found. "
-            "Set NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD in Streamlit secrets or env vars."
-        )
-
+    """Create a single Neo4j driver for the lifecycle of the app."""
+    uri = st.secrets["NEO4J_URI"]
+    user = st.secrets["NEO4J_USER"]
+    password = st.secrets["NEO4J_PASSWORD"]
     driver = GraphDatabase.driver(uri, auth=(user, password))
     return driver
 
 
-# -------------------------------------------------------------------
-# Cypher query helpers
-# -------------------------------------------------------------------
-
-
-def _run_biomarker_search(
+def run_biomarker_search(
     driver,
-    query_text: str,
-    specimen_filter: str,
-    method_filter: str,
-    limit: int,
-) -> List[Dict[str, Any]]:
+    query_text,
+    specimen_filter,
+    provenance_mode,
+    max_rows,
+):
     """
-    Run a single Cypher query to:
-      - fulltext search biomarkers by name
-      - pull linked devices, diseases, specimens, methods
-      - return both counts and neighbor lists
+    Search biomarkers by name using the full-text index, and return a table
+    including specimen_list and specimen_source.
     """
-
-    # Basic Lucene-ish query; treat empty string as wildcard
-    if query_text.strip():
-        fulltext_query = query_text.strip()
-    else:
-        fulltext_query = "*"
-
-    specimen_filter = specimen_filter.strip()
-    method_filter = method_filter.strip()
-
     cypher = """
-    // Full-text search over Biomarker.name
     CALL db.index.fulltext.queryNodes('biomarkerNameIndex', $q)
-    YIELD node AS b, score
-    WITH b, score
+    YIELD node, score
+    WITH node AS b, score
+    WHERE
+        // optional specimen text filter (e.g. 'urine')
+        ($specimen IS NULL OR toLower(b.specimen_list) CONTAINS toLower($specimen))
+        AND
+        (
+            $prov_mode = 'all'
+            OR (
+                $prov_mode = 'exclude_heuristic'
+                AND (b.specimen_source IS NULL OR NOT b.specimen_source STARTS WITH 'heuristic_')
+            )
+            OR (
+                $prov_mode = 'heuristic_only'
+                AND b.specimen_source STARTS WITH 'heuristic_'
+            )
+        )
+    OPTIONAL MATCH (b)<-[:MEASURES]-(d:Device)
+    OPTIONAL MATCH (b)-[:ASSOCIATED_WITH]->(di:Disease)
+    RETURN
+        b.biomarker_id AS biomarker_id,
+        b.name         AS biomarker,
+        b.specimen_list AS specimen,
+        b.specimen_source AS specimen_source,
+        score,
+        size(collect(DISTINCT d))  AS device_count,
+        size(collect(DISTINCT di)) AS disease_count
     ORDER BY score DESC
     LIMIT $limit
+    """
 
-    // Gather neighbors
-    OPTIONAL MATCH (d:Device)-[:MEASURES]->(b)
-    OPTIONAL MATCH (b)-[:ASSOCIATED_WITH]->(di:Disease)
-    OPTIONAL MATCH (b)-[:MEASURED_IN]->(s:Specimen)
-    OPTIONAL MATCH (b)-[:USES_METHOD]->(m:Method)
-    WITH b, score,
-         collect(DISTINCT d)  AS devices,
-         collect(DISTINCT di) AS diseases,
-         collect(DISTINCT s)  AS specimens,
-         collect(DISTINCT m)  AS methods
+    params = {
+        "q": query_text if query_text.strip() != "" else "*",
+        "specimen": specimen_filter if specimen_filter.strip() != "" else None,
+        "prov_mode": provenance_mode,
+        "limit": max_rows,
+    }
 
-    // Optional text filters on specimen & method
-    WHERE ($specimen IS NULL OR $specimen = '' OR
-           ANY(sp IN specimens WHERE toLower(sp.name) CONTAINS toLower($specimen)))
-      AND ($method   IS NULL OR $method   = '' OR
-           ANY(mt IN methods   WHERE toLower(mt.name) CONTAINS toLower($method)))
+    with driver.session() as session:
+        records = session.run(cypher, params)
+        rows = [r.data() for r in records]
 
-    RETURN b AS biomarker, score,
-           devices, diseases, specimens, methods,
-           size(devices)   AS device_count,
-           size(diseases)  AS disease_count,
-           size(specimens) AS specimen_count,
-           size(methods)   AS method_count
-    ORDER BY score DESC, biomarker.name ASC
+    if not rows:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows)
+    return df
+
+
+def load_neighborhood_graph(driver, biomarker_ids, max_nodes=150):
+    """
+    Build a simple networkx graph for a list of biomarker_ids.
+    Nodes: biomarkers, devices, diseases.
+    """
+
+    if not biomarker_ids:
+        return nx.Graph()
+
+    cypher = """
+    MATCH (b:Biomarker)
+    WHERE b.biomarker_id IN $ids
+    OPTIONAL MATCH (b)<-[m:MEASURES]-(d:Device)
+    OPTIONAL MATCH (b)-[a:ASSOCIATED_WITH]->(di:Disease)
+    RETURN b, collect(DISTINCT d) AS devices, collect(DISTINCT di) AS diseases
     """
 
     with driver.session() as session:
-        result = session.run(
-            cypher,
-            q=fulltext_query,
-            specimen=specimen_filter if specimen_filter else None,
-            method=method_filter if method_filter else None,
-            limit=limit,
-        )
-        rows = []
-        for rec in result:
-            rows.append(
-                {
-                    "biomarker": rec["biomarker"],
-                    "score": rec["score"],
-                    "devices": rec["devices"],
-                    "diseases": rec["diseases"],
-                    "specimens": rec["specimens"],
-                    "methods": rec["methods"],
-                    "device_count": rec["device_count"],
-                    "disease_count": rec["disease_count"],
-                    "specimen_count": rec["specimen_count"],
-                    "method_count": rec["method_count"],
-                }
-            )
-    return rows
+        records = session.run(cypher, {"ids": biomarker_ids})
+        rows = [r.data() for r in records]
 
+    G = nx.Graph()
 
-# -------------------------------------------------------------------
-# PyVis graph building
-# -------------------------------------------------------------------
+    # Add nodes & edges
+    for row in rows:
+        b = row["b"]
+        b_id = b["biomarker_id"]
+        b_name = b.get("name", f"BMK {b_id}")
+        G.add_node(b_id, label=b_name, kind="biomarker")
 
-
-def build_pyvis_graph(
-    rows: List[Dict[str, Any]], max_biomarkers: int
-) -> Network:
-    """
-    Build a PyVis Network from the list of biomarker rows.
-    Colors:
-       Biomarker:  cyan
-       Disease:    red
-       Device:     orange
-       Specimen:   green
-       Method:     purple
-    """
-
-    net = Network(
-        height="600px",
-        width="100%",
-        bgcolor="#ffffff",
-        font_color="#222222",
-        notebook=False,
-        directed=False,
-    )
-    net.barnes_hut()
-
-    # Limit how many biomarkers we visualise
-    rows_for_graph = rows[:max_biomarkers]
-
-    # We'll track which node IDs we've already added
-    added_nodes = set()
-
-    for row in rows_for_graph:
-        b = row["biomarker"]
-        bm_id = f"b_{b.id}"
-        bm_label = b.get("name", "Biomarker")
-
-        # Biomarker node
-        if bm_id not in added_nodes:
-            net.add_node(
-                bm_id,
-                label=bm_label,
-                color="#00c8ff",
-                title=f"Biomarker: {bm_label}",
-            )
-            added_nodes.add(bm_id)
-
-        # Devices
-        for d in row["devices"]:
-            if d is None:
+        for dev in row["devices"]:
+            if dev is None:
                 continue
-            d_id = f"d_{d.id}"
-            d_label = d.get("device_name", d.get("generic_name", "Device"))
-            if d_id not in added_nodes:
-                net.add_node(
-                    d_id,
-                    label=d_label,
-                    color="#ffb347",
-                    title=f"Device: {d_label}",
-                )
-                added_nodes.add(d_id)
-            net.add_edge(bm_id, d_id, title="MEASURES")
+            d_id = dev["device_id"]
+            d_name = dev.get("device_name", f"Device {d_id}")
+            G.add_node(d_id, label=d_name, kind="device")
+            G.add_edge(b_id, d_id)
 
-        # Diseases
         for di in row["diseases"]:
             if di is None:
                 continue
-            di_id = f"di_{di.id}"
-            di_label = di.get("name", "Disease")
-            if di_id not in added_nodes:
-                net.add_node(
-                    di_id,
-                    label=di_label,
-                    color="#ff6f69",
-                    title=f"Disease: {di_label}",
-                )
-                added_nodes.add(di_id)
-            net.add_edge(bm_id, di_id, title="ASSOCIATED_WITH")
+            dis_id = di["disease_id"]
+            dis_name = di.get("name", f"Disease {dis_id}")
+            G.add_node(dis_id, label=dis_name, kind="disease")
+            G.add_edge(b_id, dis_id)
 
-        # Specimens
-        for s in row["specimens"]:
-            if s is None:
-                continue
-            s_id = f"s_{s.id}"
-            s_label = s.get("name", "Specimen")
-            if s_id not in added_nodes:
-                net.add_node(
-                    s_id,
-                    label=s_label,
-                    color="#77dd77",
-                    title=f"Specimen: {s_label}",
-                )
-                added_nodes.add(s_id)
-            net.add_edge(bm_id, s_id, title="MEASURED_IN")
+    # If graph is too large, trim to first N nodes
+    if G.number_of_nodes() > max_nodes:
+        # simple trimming: keep first max_nodes nodes
+        nodes_to_keep = list(G.nodes())[:max_nodes]
+        G = G.subgraph(nodes_to_keep).copy()
 
-        # Methods
-        for m in row["methods"]:
-            if m is None:
-                continue
-            m_id = f"m_{m.id}"
-            m_label = m.get("name", "Method")
-            if m_id not in added_nodes:
-                net.add_node(
-                    m_id,
-                    label=m_label,
-                    color="#c299ff",
-                    title=f"Method: {m_label}",
-                )
-                added_nodes.add(m_id)
-            net.add_edge(bm_id, m_id, title="USES_METHOD")
-
-    return net
+    return G
 
 
-# -------------------------------------------------------------------
-# Streamlit UI
-# -------------------------------------------------------------------
+def draw_graph(G):
+    """Render a simple networkx graph into Streamlit."""
+    if G.number_of_nodes() == 0:
+        st.info("No graph neighborhood available for this query.")
+        return
 
+    pos = nx.spring_layout(G, seed=42, k=0.4)
+
+    biomarker_nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "biomarker"]
+    device_nodes    = [n for n, d in G.nodes(data=True) if d.get("kind") == "device"]
+    disease_nodes   = [n for n, d in G.nodes(data=True) if d.get("kind") == "disease"]
+
+    plt.figure(figsize=(10, 7))
+
+    nx.draw_networkx_nodes(G, pos, nodelist=biomarker_nodes)
+    nx.draw_networkx_nodes(G, pos, nodelist=device_nodes)
+    nx.draw_networkx_nodes(G, pos, nodelist=disease_nodes)
+    nx.draw_networkx_edges(G, pos, alpha=0.3)
+
+    labels = {n: d.get("label", "") for n, d in G.nodes(data=True)}
+    nx.draw_networkx_labels(G, pos, labels, font_size=7)
+
+    plt.axis("off")
+    st.pyplot(plt.gcf())
+    plt.close()
+
+
+# ----------------------------
+# Streamlit layout
+# ----------------------------
 
 def main():
-    st.set_page_config(
-        page_title="Biomarker / Disease / Method Search",
-        layout="wide",
-        page_icon="🧬",
-    )
+    st.set_page_config(page_title="Biomarker / Disease / Method Search", layout="wide")
 
     st.title("Biomarker / Disease / Method Search")
     st.write(
-        "Search across your **biomarkers**, linked **diseases**, **devices**, "
-        "**specimens** (biofluids) and **detection methods** from the Neo4j Aura graph."
+        "Search across your **biomarkers**, linked diseases, devices and specimen "
+        "(biofluid) information from the Neo4j Aura graph. "
+        "Specimen provenance is shown so you can distinguish heuristic vs curated data."
     )
 
-    # Sidebar search controls
+    driver = get_driver()
+
+    # Sidebar controls
     with st.sidebar:
         st.header("Search settings")
-        query_text = st.text_input(
-            "Search by biomarker name or keyword",
-            value="BRCA1",
-            help="Full-text search over biomarker names.",
-        )
+
+        query_text = st.text_input("Search by biomarker name or keyword", "BRCA1")
 
         specimen_filter = st.text_input(
-            "Specimen filter (optional)",
-            placeholder="e.g., urine, blood",
-            help="Filter to biomarkers that are measured in specimens whose names contain this text.",
+            "Specimen text filter (optional)",
+            help="e.g. 'urine', 'blood', 'tumor tissue'. "
+                 "This matches against the specimen_list text."
         )
 
-        method_filter = st.text_input(
-            "Method filter (optional)",
-            placeholder="e.g., colorimetric assay",
-            help="Filter to biomarkers that use methods whose names contain this text.",
+        provenance_mode = st.radio(
+            "Specimen provenance",
+            options=["all", "exclude_heuristic", "heuristic_only"],
+            index=0,
+            help=(
+                "'exclude_heuristic' hides any specimens inferred by heuristics "
+                "(sources starting with 'heuristic_'). "
+                "'heuristic_only' shows only those."
+            ),
         )
 
-        max_table_rows = st.slider(
-            "Max table rows",
-            min_value=10,
-            max_value=200,
-            value=50,
-            step=10,
-        )
-
+        max_rows = st.slider("Max table rows", min_value=10, max_value=200, value=50, step=10)
         max_graph_biomarkers = st.slider(
-            "Max graph biomarkers",
-            min_value=5,
-            max_value=100,
-            value=40,
-            step=5,
+            "Max biomarkers in graph", min_value=5, max_value=100, value=40, step=5
         )
 
         run_button = st.button("Run search")
 
-    # If user hasn't explicitly clicked, we still run once with defaults
-    if not run_button and not query_text:
-        st.info("Enter a biomarker keyword on the left and click **Run search**.")
+    if not run_button:
+        st.info("Set your filters on the left and click **Run search**.")
         return
 
-    # Neo4j query
-    try:
-        driver = get_driver()
-    except Exception as e:
-        st.error(f"Error connecting to Neo4j: {e}")
-        return
-
-    query_limit = max(max_table_rows, max_graph_biomarkers)
-
-    with st.spinner("Querying Neo4j…"):
-        try:
-            rows = _run_biomarker_search(
-                driver=driver,
-                query_text=query_text,
-                specimen_filter=specimen_filter,
-                method_filter=method_filter,
-                limit=query_limit,
-            )
-        except Exception as e:
-            st.error(f"Error running Neo4j query: {e}")
-            return
-
-    if not rows:
-        st.warning("No biomarkers matched your query/filters.")
-        return
-
-    # ----------------------------------------------------------------
-    # Tabular results
-    # ----------------------------------------------------------------
-    st.subheader("Tabular results")
-
-    table_rows = []
-    for row in rows[:max_table_rows]:
-        b = row["biomarker"]
-        table_rows.append(
-            {
-                "biomarker_id": b.get("biomarker_id", ""),
-                "biomarker": b.get("name", ""),
-                "score": round(float(row["score"]), 3),
-                "devices": row["device_count"],
-                "diseases": row["disease_count"],
-                "specimens": row["specimen_count"],
-                "methods": row["method_count"],
-            }
+    # Run query
+    with st.spinner("Querying Neo4j..."):
+        df = run_biomarker_search(
+            driver,
+            query_text=query_text,
+            specimen_filter=specimen_filter,
+            provenance_mode=provenance_mode,
+            max_rows=max_rows,
         )
 
-    df = pd.DataFrame(table_rows)
-    st.dataframe(
-        df,
-        use_container_width=True,
-        hide_index=True,
-    )
+    st.subheader("Tabular results")
+    if df.empty:
+        st.warning("No biomarkers matched your query/filters.")
+    else:
+        st.dataframe(df)
 
-    # ----------------------------------------------------------------
-    # Network view
-    # ----------------------------------------------------------------
+    # Network view for top N biomarkers
     st.subheader("Network view")
 
-    try:
-        net = build_pyvis_graph(rows, max_biomarkers=max_graph_biomarkers)
-        # Save to a temporary HTML file
-        html_path = "network.html"
-        net.show_buttons(filter_=["physics"])  # allow user to tweak layout
-        net.save_graph(html_path)
+    if df.empty:
+        st.info("No graph neighborhood available for this query.")
+        return
 
-        with open(html_path, "r", encoding="utf-8") as f:
-            html = f.read()
+    biomarker_ids = list(df["biomarker_id"].astype(str))[:max_graph_biomarkers]
 
-        components.html(html, height=600, scrolling=True)
-    except Exception as e:
-        st.error(f"Graph rendering error: {e}")
+    with st.spinner("Loading graph neighborhood..."):
+        G = load_neighborhood_graph(driver, biomarker_ids)
+
+    draw_graph(G)
+
+    st.caption(
+        "Note: specimen_source indicates where the specimen_list value came from "
+        "(e.g. heuristic_text_v1, heuristic_text_v2, curated_xxx, etc.)."
+    )
 
 
 if __name__ == "__main__":
