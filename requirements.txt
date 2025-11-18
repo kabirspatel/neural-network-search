@@ -2,4 +2,4 @@ streamlit==1.29.0
 neo4j==5.20.0
 pandas
 networkx
-matplotlib
+pyvis==0.3.1

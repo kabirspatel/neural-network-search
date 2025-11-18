@@ -2,7 +2,7 @@ import streamlit as st
 from neo4j import GraphDatabase
 import pandas as pd
 import networkx as nx
-import matplotlib.pyplot as plt
+from pyvis.network import Network
 
 
 # ----------------------------
@@ -137,30 +137,45 @@ def load_neighborhood_graph(driver, biomarker_ids, max_nodes=150):
 
 
 def draw_graph(G):
-    """Render a simple networkx graph into Streamlit."""
+    """Render the NetworkX graph in Streamlit using PyVis (no matplotlib)."""
+
     if G.number_of_nodes() == 0:
         st.info("No graph neighborhood available for this query.")
         return
 
-    pos = nx.spring_layout(G, seed=42, k=0.4)
+    # Create PyVis network
+    net = Network(height="650px", width="100%", bgcolor="#ffffff", font_color="black")
 
-    biomarker_nodes = [n for n, d in G.nodes(data=True) if d.get("kind") == "biomarker"]
-    device_nodes    = [n for n, d in G.nodes(data=True) if d.get("kind") == "device"]
-    disease_nodes   = [n for n, d in G.nodes(data=True) if d.get("kind") == "disease"]
+    # Improve physics (layout)
+    net.force_atlas_2based(gravity=-30, central_gravity=0.01, spring_length=100, spring_strength=0.01)
 
-    plt.figure(figsize=(10, 7))
+    # Add nodes with colors based on kind
+    for n, d in G.nodes(data=True):
+        kind = d.get("kind", "")
 
-    nx.draw_networkx_nodes(G, pos, nodelist=biomarker_nodes)
-    nx.draw_networkx_nodes(G, pos, nodelist=device_nodes)
-    nx.draw_networkx_nodes(G, pos, nodelist=disease_nodes)
-    nx.draw_networkx_edges(G, pos, alpha=0.3)
+        if kind == "biomarker":
+            color = "#1f77b4"
+        elif kind == "device":
+            color = "#2ca02c"
+        elif kind == "disease":
+            color = "#d62728"
+        else:
+            color = "#7f7f7f"
 
-    labels = {n: d.get("label", "") for n, d in G.nodes(data=True)}
-    nx.draw_networkx_labels(G, pos, labels, font_size=7)
+        net.add_node(
+            n,
+            label=d.get("label", str(n)),
+            color=color,
+            title=f"{kind}: {d.get('label','')}"
+        )
 
-    plt.axis("off")
-    st.pyplot(plt.gcf())
-    plt.close()
+    # Add edges
+    for u, v in G.edges():
+        net.add_edge(u, v)
+
+    # Save and display
+    net.save_graph("graph.html")
+    st.components.v1.html(open("graph.html", "r").read(), height=650, scrolling=True)
 
 
 # ----------------------------
