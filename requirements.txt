@@ -6,5 +6,9 @@ pyvis>=0.3.2
 neo4j>=5.23
 python-dotenv>=1.0
 
+requests==2.32.3
+openpyxl==3.1.5     # only needed if your biomarker matrix is in .xlsx
+
+
 # (Optional) only if you still use matplotlib anywhere; otherwise delete this line
 # matplotlib>=3.8
