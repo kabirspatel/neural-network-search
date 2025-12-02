@@ -1,521 +1,463 @@
 import os
-from typing import Dict, Any, List, Tuple
+from dataclasses import dataclass
+from typing import List, Dict, Any, Tuple
 
-import pandas as pd
 import streamlit as st
-from neo4j import GraphDatabase, basic_auth
+from neo4j import GraphDatabase
+import networkx as nx
+import matplotlib.pyplot as plt
+import pandas as pd
 
-# --- optional interactive graph deps ---
-try:
-    from pyvis.network import Network
-    import streamlit.components.v1 as components
-
-    PYVIS_AVAILABLE = True
-except ImportError:
-    PYVIS_AVAILABLE = False
 
 # -----------------------------
 # Neo4j connection helpers
 # -----------------------------
 
+@dataclass
+class Neo4jConfig:
+    uri: str
+    user: str
+    password: str
+
 
 @st.cache_resource(show_spinner=False)
-def get_neo4j_driver():
-    uri = os.getenv("NEO4J_URI")
-    user = os.getenv("NEO4J_USER")
-    password = os.getenv("NEO4J_PASSWORD")
-
-    if not uri or not user or not password:
-        raise RuntimeError(
-            "NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD must be set as environment variables."
-        )
-
-    driver = GraphDatabase.driver(uri, auth=basic_auth(user, password))
-    return driver
+def get_driver(cfg: Neo4jConfig):
+    return GraphDatabase.driver(cfg.uri, auth=(cfg.user, cfg.password))
 
 
-def run_cypher(query: str, params: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
-    driver = get_neo4j_driver()
+def run_query(driver, query: str, params: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
     with driver.session() as session:
-        result = session.run(query, params or {})
-        return [dict(record) for record in result]
+        result = session.run(query, **(params or {}))
+        return [r.data() for r in result]
 
 
 # -----------------------------
-# Cached summary + metadata
+# Graph summary queries
 # -----------------------------
 
+def get_graph_summary(driver) -> Dict[str, int]:
+    summary: Dict[str, int] = {}
 
-@st.cache_data(show_spinner=False)
-def get_summary_counts() -> Dict[str, int]:
-    query = """
-    CALL {
-      MATCH (b:Biomarker) RETURN count(b) AS biomarkers
+    q_nodes = {
+        "biomarkers": "MATCH (b:Biomarker) RETURN count(b) AS n",
+        "diseases": "MATCH (d:Disease) RETURN count(d) AS n",
+        "specimens": "MATCH (s:Specimen) RETURN count(s) AS n",
+        "methods": "MATCH (m:DetectionMethod) RETURN count(m) AS n",
+        "devices": "MATCH (dev:Device) RETURN count(dev) AS n",
     }
-    CALL {
-      MATCH (d:Disease) RETURN count(d) AS diseases
+    q_edges = {
+        "bd_edges": """
+            MATCH ()-[r:BIOMARKER_ASSOCIATED_WITH_DISEASE]-()
+            RETURN count(r) AS n
+        """
     }
-    CALL {
-      MATCH (s:Specimen) RETURN count(s) AS specimens
-    }
-    CALL {
-      MATCH (m:DetectionMethod) RETURN count(m) AS methods
-    }
-    CALL {
-      MATCH (d:Device) RETURN count(d) AS devices
-    }
-    CALL {
-      MATCH ()-[r:BIOMARKER_ASSOCIATED_WITH_DISEASE]->() RETURN count(r) AS biomarker_disease_edges
-    }
-    RETURN biomarkers, diseases, specimens, methods, devices, biomarker_disease_edges
-    """
-    rows = run_cypher(query)
-    return rows[0] if rows else {}
 
+    for key, q in q_nodes.items():
+        rows = run_query(driver, q)
+        summary[key] = rows[0]["n"] if rows else 0
 
-@st.cache_data(show_spinner=False)
-def get_disease_categories() -> List[str]:
-    query = """
-    MATCH ()-[r:BIOMARKER_ASSOCIATED_WITH_DISEASE]->()
-    WHERE r.disease_category IS NOT NULL
-    RETURN DISTINCT r.disease_category AS cat
-    ORDER BY cat
-    """
-    rows = run_cypher(query)
-    return [r["cat"] for r in rows if r.get("cat")]
+    for key, q in q_edges.items():
+        rows = run_query(driver, q)
+        summary[key] = rows[0]["n"] if rows else 0
+
+    return summary
 
 
 # -----------------------------
-# Path-graph data builder
+# Graph building
 # -----------------------------
 
-
-def get_path_graph_data(q: str, max_pairs: int = 10) -> Tuple[Dict[str, Dict[str, Any]], List[Tuple[str, str, str]]]:
+def get_paths_for_search(
+    driver,
+    search_term: str,
+    min_pubmed: int,
+    max_pairs: int,
+    max_devices_per_biomarker: int,
+) -> Tuple[nx.Graph, Dict[str, str]]:
     """
-    Build a node/edge set for a path-style graph centered on biomarker–disease
-    edges that match the search term.
-
-    Returns:
-      nodes: {id_str: {"label": str, "kind": "Biomarker"/"Disease"/...}}
-      edges: [(src_id_str, dst_id_str, rel_type), ...]
+    Build a NetworkX graph around the search term, including:
+      Biomarker --(BIOMARKER_ASSOCIATED_WITH_DISEASE)--> Disease
+      Biomarker <-> Specimen
+      Disease   <-> Specimen
+      Device    --(MEASURES)--> Biomarker
+      Device    --(USES_METHOD)--> DetectionMethod
     """
-    cypher = """
-    MATCH (b:Biomarker)-[:BIOMARKER_ASSOCIATED_WITH_DISEASE]->(d:Disease)
-    WHERE toLower(b.name) CONTAINS $q OR toLower(d.name) CONTAINS $q
-    WITH DISTINCT b, d
-    LIMIT $max_pairs
+    q = search_term.strip().lower()
 
-    OPTIONAL MATCH (b)-[:BIOMARKER_ASSOCIATED_WITH_DISEASE]->(d)
-    WITH DISTINCT b, d
-    AS bd, collect({b:b, d:d}) AS bd_pairs
-
-    UNWIND bd_pairs AS pair
-    WITH pair.b AS b, pair.d AS d
-
-    OPTIONAL MATCH (b)-[:MEASURED_IN_SPECIMEN]->(s1:Specimen)
-    OPTIONAL MATCH (d)-[:DETECTED_IN_SPECIMEN]->(s2:Specimen)
-    OPTIONAL MATCH (dev:Device)-[:INTENDED_FOR]->(d)
-    OPTIONAL MATCH (dev)-[:USES_METHOD]->(m:DetectionMethod)
-
-    RETURN
-      id(b) AS b_id, b.name AS b_name,
-      id(d) AS d_id, d.name AS d_name,
-      id(s1) AS s1_id, s1.name AS s1_name,
-      id(s2) AS s2_id, s2.name AS s2_name,
-      id(dev) AS dev_id, dev.device_name AS dev_name,
-      id(m) AS m_id, m.name AS m_name
-    """
-
-    rows = run_cypher(cypher, {"q": q.lower(), "max_pairs": int(max_pairs)})
-
-    nodes: Dict[str, Dict[str, Any]] = {}
-    edges_set: set[Tuple[str, str, str]] = set()
-
-    def add_node(node_id, label, kind):
-        if node_id is None or label is None:
-            return
-        nid = str(node_id)
-        if nid not in nodes:
-            nodes[nid] = {"label": label, "kind": kind}
-
-    def add_edge(src_id, dst_id, rel_type):
-        if src_id is None or dst_id is None:
-            return
-        edges_set.add((str(src_id), str(dst_id), rel_type))
-
-    for r in rows:
-        b_id, b_name = r.get("b_id"), r.get("b_name")
-        d_id, d_name = r.get("d_id"), r.get("d_name")
-        s1_id, s1_name = r.get("s1_id"), r.get("s1_name")
-        s2_id, s2_name = r.get("s2_id"), r.get("s2_name")
-        dev_id, dev_name = r.get("dev_id"), r.get("dev_name")
-        m_id, m_name = r.get("m_id"), r.get("m_name")
-
-        # Nodes
-        add_node(b_id, b_name, "Biomarker")
-        add_node(d_id, d_name, "Disease")
-        add_node(s1_id, s1_name, "Specimen")
-        add_node(s2_id, s2_name, "Specimen")
-        add_node(dev_id, dev_name, "Device")
-        add_node(m_id, m_name, "DetectionMethod")
-
-        # Edges
-        add_edge(b_id, d_id, "BIOMARKER_ASSOCIATED_WITH_DISEASE")
-        add_edge(b_id, s1_id, "MEASURED_IN_SPECIMEN")
-        add_edge(d_id, s2_id, "DETECTED_IN_SPECIMEN")
-        add_edge(dev_id, d_id, "INTENDED_FOR")
-        add_edge(dev_id, m_id, "USES_METHOD")
-
-    return nodes, list(edges_set)
-
-
-def render_path_graph(nodes: Dict[str, Dict[str, Any]], edges: List[Tuple[str, str, str]], height: int = 650):
-    if not PYVIS_AVAILABLE:
-        st.error(
-            "pyvis is not installed. Run `pip install pyvis` in your environment "
-            "to enable the interactive graph."
-        )
-        return
-
-    if not nodes:
-        st.warning("No nodes/edges to display for this query.")
-        return
-
-    net = Network(
-        height=f"{height}px",
-        width="100%",
-        bgcolor="#ffffff",
-        font_color="#000000",
-        directed=True,
+    # 1) Core biomarker–disease pairs
+    bd_rows = run_query(
+        driver,
+        """
+        MATCH (b:Biomarker)-[r:BIOMARKER_ASSOCIATED_WITH_DISEASE]->(d:Disease)
+        WHERE ($q = '' OR toLower(b.name) CONTAINS $q OR toLower(d.name) CONTAINS $q)
+          AND (r.pubmed_count IS NULL OR r.pubmed_count >= $min_pubmed)
+        WITH b, d, r
+        ORDER BY coalesce(r.pubmed_count, 0) DESC
+        LIMIT $max_pairs
+        RETURN b, d, r.pubmed_count AS pubmed_count
+        """,
+        {"q": q, "min_pubmed": min_pubmed, "max_pairs": max_pairs},
     )
 
-    net.barnes_hut()
-    net.toggle_physics(True)
-    net.show_buttons(filter_=["physics"])
+    G = nx.Graph()
+    node_types: Dict[str, str] = {}
 
-    style_map = {
-        "Biomarker": {"color": "#FF7F0E", "shape": "dot"},
-        "Disease": {"color": "#1F77B4", "shape": "dot"},
-        "Specimen": {"color": "#2CA02C", "shape": "dot"},
-        "Device": {"color": "#9467BD", "shape": "square"},
-        "DetectionMethod": {"color": "#8C564B", "shape": "triangle"},
-    }
+    if not bd_rows:
+        return G, node_types  # empty
 
-    for nid, meta in nodes.items():
-        label = meta["label"]
-        kind = meta.get("kind", "Node")
-        style = style_map.get(kind, {"color": "#7F7F7F", "shape": "dot"})
-        net.add_node(
-            nid,
-            label=label,
-            title=f"{kind}: {label}",
-            color=style["color"],
-            shape=style["shape"],
+    biomarkers: set[str] = set()
+    diseases: set[str] = set()
+
+    for row in bd_rows:
+        b = row["b"]
+        d = row["d"]
+        pubmed = row.get("pubmed_count")
+
+        b_name = b["name"]
+        d_name = d["name"]
+        biomarkers.add(b_name)
+        diseases.add(d_name)
+
+        G.add_node(b_name)
+        node_types[b_name] = "biomarker"
+
+        G.add_node(d_name)
+        node_types[d_name] = "disease"
+
+        G.add_edge(
+            b_name,
+            d_name,
+            relation="BIOMARKER_ASSOCIATED_WITH_DISEASE",
+            pubmed_count=pubmed,
         )
 
-    for src, dst, rel in edges:
-        net.add_edge(src, dst, label="", title=rel, arrows="to")
+    # 2) Specimens linked to these biomarkers and diseases
+    spec_rows_b = run_query(
+        driver,
+        """
+        MATCH (b:Biomarker)-[:MEASURED_IN_SPECIMEN]->(s:Specimen)
+        WHERE b.name IN $biomarkers
+        RETURN b.name AS biomarker, s.name AS specimen
+        """,
+        {"biomarkers": list(biomarkers)},
+    )
 
-    html = net.generate_html(notebook=False)
-    components.html(html, height=height, scrolling=True)
+    spec_rows_d = run_query(
+        driver,
+        """
+        MATCH (d:Disease)-[:DETECTED_IN_SPECIMEN]->(s:Specimen)
+        WHERE d.name IN $diseases
+        RETURN d.name AS disease, s.name AS specimen
+        """,
+        {"diseases": list(diseases)},
+    )
+
+    for row in spec_rows_b:
+        b_name = row["biomarker"]
+        s_name = row["specimen"]
+        G.add_node(s_name)
+        node_types[s_name] = "specimen"
+        G.add_edge(b_name, s_name, relation="MEASURED_IN_SPECIMEN")
+
+    for row in spec_rows_d:
+        d_name = row["disease"]
+        s_name = row["specimen"]
+        G.add_node(s_name)
+        node_types[s_name] = "specimen"
+        G.add_edge(d_name, s_name, relation="DETECTED_IN_SPECIMEN")
+
+    # 3) Devices and detection methods for these biomarkers
+    if max_devices_per_biomarker > 0:
+        dev_rows = run_query(
+            driver,
+            """
+            MATCH (dev:Device)-[:MEASURES]->(b:Biomarker)
+            WHERE b.name IN $biomarkers
+            WITH b.name AS biomarker, dev
+            ORDER BY dev.device_name
+            WITH biomarker, collect(dev)[0..$max_devices] AS devs
+            UNWIND devs AS dev
+            OPTIONAL MATCH (dev)-[:USES_METHOD]->(m:DetectionMethod)
+            RETURN biomarker,
+                   dev.device_name AS device_name,
+                   m.name AS method_name
+            """,
+            {
+                "biomarkers": list(biomarkers),
+                "max_devices": max_devices_per_biomarker,
+            },
+        )
+
+        for row in dev_rows:
+            biomarker_name = row["biomarker"]
+            device_name = row["device_name"]
+            method_name = row.get("method_name")
+
+            if device_name:
+                G.add_node(device_name)
+                node_types[device_name] = "device"
+                G.add_edge(device_name, biomarker_name, relation="MEASURES")
+
+            if method_name:
+                G.add_node(method_name)
+                node_types[method_name] = "method"
+                G.add_edge(device_name, method_name, relation="USES_METHOD")
+
+    return G, node_types
+
+
+def draw_graph(G: nx.Graph, node_types: Dict[str, str]):
+    if len(G.nodes) == 0:
+        st.info("No graph paths found for this search / filters.")
+        return
+
+    type_colors = {
+        "biomarker": "#7b48ff",       # purple
+        "disease": "#ff7f0e",         # orange
+        "specimen": "#2ca02c",        # green
+        "device": "#1f77b4",          # blue
+        "method": "#d62728",          # red
+    }
+
+    node_color_list = [
+        type_colors.get(node_types.get(n, "biomarker"), "#7b48ff")
+        for n in G.nodes()
+    ]
+
+    # Layout
+    pos = nx.spring_layout(G, k=0.6, iterations=60, seed=42)
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    nx.draw_networkx_nodes(
+        G,
+        pos,
+        node_size=40,
+        node_color=node_color_list,
+        alpha=0.9,
+        ax=ax,
+    )
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        alpha=0.25,
+        width=0.5,
+        ax=ax,
+    )
+
+    # Only label a subset to avoid clutter: high-degree nodes
+    degrees = dict(G.degree())
+    label_nodes = sorted(degrees, key=degrees.get, reverse=True)[:30]
+    labels = {n: n for n in label_nodes}
+
+    nx.draw_networkx_labels(
+        G,
+        pos,
+        labels=labels,
+        font_size=6,
+        ax=ax,
+    )
+
+    ax.axis("off")
+    st.pyplot(fig)
+
+    # Legend / key
+    st.markdown(
+        """
+**Color key**
+
+- <span style="color:#7b48ff;">●</span> **Biomarker**
+- <span style="color:#ff7f0e;">●</span> **Disease**
+- <span style="color:#2ca02c;">●</span> **Specimen**
+- <span style="color:#1f77b4;">●</span> **Device**
+- <span style="color:#d62728;">●</span> **Detection method**
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # -----------------------------
 # Streamlit UI
 # -----------------------------
 
-st.set_page_config(
-    page_title="Biomarker–Disease & Device Explorer",
-    layout="wide",
-)
-
-st.title("Biomarker–Disease & Device Knowledge Graph Explorer")
-
-with st.sidebar:
-    st.markdown("### Connection")
-    try:
-        driver = get_neo4j_driver()
-        st.success("Connected to Neo4j")
-    except Exception as e:
-        st.error(f"Neo4j connection error: {e}")
-        st.stop()
-
-    st.markdown("### Search")
-    search_term = st.text_input(
-        "Search term",
-        value="",
-        placeholder="e.g., breast cancer, CRP, urine, immunoassay, urinalysis",
-    )
-    search_clicked = st.button("Search")  # explicit button
-
-    min_pubmed = st.number_input(
-        "Minimum PubMed count (for biomarker–disease edges)",
-        min_value=0,
-        value=0,
-        step=1,
+def main():
+    st.set_page_config(
+        page_title="Biomarker–Disease & Device Knowledge Graph Explorer",
+        layout="wide",
     )
 
-    disease_category_options = ["(All)"] + get_disease_categories()
-    selected_category = st.selectbox(
-        "Disease category filter (for edges)",
-        options=disease_category_options,
-        index=0,
-    )
+    st.title("Biomarker–Disease & Device Knowledge Graph Explorer")
 
-    st.markdown("---")
-    st.caption("This app queries your Aura Neo4j knowledge graph and live FDA 510(k) device data.")
+    # --- Neo4j connection ---
 
-q = search_term.strip()
+    uri = os.getenv("NEO4J_URI", "")
+    user = os.getenv("NEO4J_USER", "")
+    password = os.getenv("NEO4J_PASSWORD", "")
 
-summary = get_summary_counts()
-if summary:
-    st.markdown(
-        f"""
-        **Graph summary**
+    col_conn, col_main = st.columns([1, 3])
 
-        - Biomarkers: `{summary.get("biomarkers", 0)}`
-        - Diseases: `{summary.get("diseases", 0)}`
-        - Specimens: `{summary.get("specimens", 0)}`
-        - Detection methods: `{summary.get("methods", 0)}`
-        - FDA devices (subset): `{summary.get("devices", 0)}`
-        - Biomarker–Disease edges: `{summary.get("biomarker_disease_edges", 0)}`
-        """
-    )
-
-# -----------------------------
-# Global interactive path graph (under summary, above tabs)
-# -----------------------------
-st.markdown("### Path-style interactive graph")
-
-if not q:
-    st.info(
-        "Enter a search term in the sidebar and click **Search** to see an interactive graph of "
-        "biomarkers, diseases, specimens, devices, and detection methods."
-    )
-else:
-    max_pairs = st.slider(
-        "Max biomarker–disease pairs to include in the graph",
-        min_value=1,
-        max_value=30,
-        value=10,
-        key="graph_max_pairs",
-    )
-
-    nodes, edges = get_path_graph_data(q, max_pairs=max_pairs)
-
-    st.caption(
-        "Graph nodes include Biomarkers, Diseases, Specimens, Devices, and Detection Methods. "
-        "Edges show the relationships between them."
-    )
-
-    render_path_graph(nodes, edges, height=650)
-
-    if nodes:
-        node_df = pd.DataFrame(
-            [{"id": nid, "label": meta["label"], "kind": meta["kind"]} for nid, meta in nodes.items()]
-        ).sort_values("kind")
-        with st.expander("Show node list"):
-            st.dataframe(node_df, use_container_width=True)
-
-st.markdown("---")
-
-# -----------------------------
-# Tabs (3 only)
-# -----------------------------
-tabs = st.tabs(
-    [
-        "Biomarkers & Diseases",
-        "Specimens",
-        "Devices & Detection Methods",
-    ]
-)
-
-# -----------------------------
-# Tab 1: Biomarkers & Diseases
-# -----------------------------
-with tabs[0]:
-    st.subheader("Biomarker ↔ Disease edges")
-
-    if not q:
-        st.info("Enter a search term in the sidebar and click **Search** to see biomarker–disease edges.")
-    else:
-        params = {
-            "q": q.lower(),
-            "min_pubmed": int(min_pubmed),
-        }
-
-        category_filter = ""
-        if selected_category != "(All)":
-            category_filter = "AND r.disease_category = $category"
-            params["category"] = selected_category
-
-        query = f"""
-        MATCH (b:Biomarker)-[r:BIOMARKER_ASSOCIATED_WITH_DISEASE]->(d:Disease)
-        WHERE
-          (toLower(b.name) CONTAINS $q OR toLower(d.name) CONTAINS $q)
-          AND r.pubmed_count >= $min_pubmed
-          {category_filter}
-        OPTIONAL MATCH (b)-[:MEASURED_IN_SPECIMEN]->(bs:Specimen)
-        OPTIONAL MATCH (d)-[:DETECTED_IN_SPECIMEN]->(ds:Specimen)
-        RETURN
-          b.name AS biomarker,
-          d.name AS disease,
-          r.disease_category AS disease_category,
-          d.is_cancer_like AS disease_is_cancer_like,
-          r.pubmed_count AS pubmed_count,
-          collect(DISTINCT bs.name) AS biomarker_specimens,
-          collect(DISTINCT ds.name) AS disease_specimens
-        ORDER BY pubmed_count DESC, biomarker, disease
-        LIMIT 500
-        """
-        rows = run_cypher(query, params)
-
-        if not rows:
-            st.warning("No biomarker–disease edges matched your search/filters.")
+    with col_conn:
+        st.subheader("Connection")
+        if not uri or not user or not password:
+            st.error(
+                "Neo4j connection error: NEO4J_URI, NEO4J_USER, and NEO4J_PASSWORD "
+                "must be set as environment variables."
+            )
+            driver = None
         else:
-            df = pd.DataFrame(rows)
-            if "biomarker_specimens" in df.columns:
-                df["biomarker_specimens"] = df["biomarker_specimens"].apply(
-                    lambda xs: ", ".join(sorted({x for x in xs if x})) if isinstance(xs, list) else ""
+            cfg = Neo4jConfig(uri=uri, user=user, password=password)
+            try:
+                driver = get_driver(cfg)
+                st.success("Connected to Neo4j")
+            except Exception as e:
+                st.error(f"Could not connect to Neo4j: {e}")
+                driver = None
+
+        st.markdown("---")
+        st.subheader("Search")
+
+        search_term = st.text_input(
+            "Search term (biomarker or disease name)",
+            value="glucose",
+            help="Example: 'glucose', 'troponin', 'acute myeloid leukemia', etc.",
+        )
+
+        min_pubmed = st.number_input(
+            "Minimum PubMed count (for biomarker–disease edges)",
+            value=0,
+            min_value=0,
+            step=1,
+        )
+
+    with col_main:
+        if driver is None:
+            st.info("Configure Neo4j environment variables to explore the graph.")
+            return
+
+        # Graph summary
+        summary = get_graph_summary(driver)
+        st.subheader("Graph summary")
+        st.markdown(
+            f"""
+- Biomarkers: <span style="background-color:#111;padding:2px 6px;border-radius:4px;">{summary.get("biomarkers", 0)}</span>  
+- Diseases: <span style="background-color:#111;padding:2px 6px;border-radius:4px;">{summary.get("diseases", 0)}</span>  
+- Specimens: <span style="background-color:#111;padding:2px 6px;border-radius:4px;">{summary.get("specimens", 0)}</span>  
+- Detection methods: <span style="background-color:#111;padding:2px 6px;border-radius:4px;">{summary.get("methods", 0)}</span>  
+- FDA devices (subset): <span style="background-color:#111;padding:2px 6px;border-radius:4px;">{summary.get("devices", 0)}</span>  
+- Biomarker–Disease edges: <span style="background-color:#111;padding:2px 6px;border-radius:4px;">{summary.get("bd_edges", 0)}</span>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("### Path-style interactive graph")
+
+        col_slider1, col_slider2 = st.columns([1, 1])
+
+        with col_slider1:
+            max_pairs = st.slider(
+                "Max biomarker–disease pairs to include in the graph",
+                min_value=1,
+                max_value=30,
+                value=10,
+            )
+        with col_slider2:
+            max_devices_per_biomarker = st.slider(
+                "Max devices per biomarker (to keep graph readable)",
+                min_value=0,
+                max_value=50,
+                value=10,
+            )
+
+        # Build and draw graph
+        G, node_types = get_paths_for_search(
+            driver,
+            search_term=search_term,
+            min_pubmed=min_pubmed,
+            max_pairs=max_pairs,
+            max_devices_per_biomarker=max_devices_per_biomarker,
+        )
+
+        draw_graph(G, node_types)
+
+        # ----------------- Tabs with detail tables -----------------
+        st.markdown("---")
+        tab_bd, tab_spec, tab_dev = st.tabs(
+            ["Biomarkers & Diseases", "Specimens", "Devices & Detection Methods"]
+        )
+
+        # Tab 1: biomarker–disease table
+        with tab_bd:
+            bd_table = run_query(
+                driver,
+                """
+                MATCH (b:Biomarker)-[r:BIOMARKER_ASSOCIATED_WITH_DISEASE]->(d:Disease)
+                WHERE ($q = '' OR toLower(b.name) CONTAINS $q OR toLower(d.name) CONTAINS $q)
+                  AND (r.pubmed_count IS NULL OR r.pubmed_count >= $min_pubmed)
+                RETURN b.name AS biomarker,
+                       d.name AS disease,
+                       r.pubmed_count AS pubmed_count,
+                       r.disease_category AS disease_category
+                ORDER BY coalesce(r.pubmed_count, 0) DESC
+                LIMIT 200
+                """,
+                {"q": search_term.lower().strip(), "min_pubmed": min_pubmed},
+            )
+            if bd_table:
+                st.dataframe(pd.DataFrame(bd_table))
+            else:
+                st.info("No biomarker–disease edges matched this search / filter.")
+
+        # Tab 2: specimen view
+        with tab_spec:
+            spec_table = run_query(
+                driver,
+                """
+                MATCH (b:Biomarker)-[:MEASURED_IN_SPECIMEN]->(s:Specimen)
+                WHERE ($q = '' OR toLower(b.name) CONTAINS $q)
+                RETURN b.name AS biomarker,
+                       s.name AS specimen,
+                       'biomarker → specimen' AS relation
+                UNION ALL
+                MATCH (d:Disease)-[:DETECTED_IN_SPECIMEN]->(s:Specimen)
+                WHERE ($q = '' OR toLower(d.name) CONTAINS $q)
+                RETURN d.name AS biomarker,
+                       s.name AS specimen,
+                       'disease → specimen' AS relation
+                LIMIT 200
+                """,
+                {"q": search_term.lower().strip()},
+            )
+            if spec_table:
+                st.dataframe(pd.DataFrame(spec_table))
+            else:
+                st.info("No specimen relationships matched this search.")
+
+        # Tab 3: devices & detection methods
+        with tab_dev:
+            dev_table = run_query(
+                driver,
+                """
+                MATCH (dev:Device)-[:MEASURES]->(b:Biomarker)
+                WHERE ($q = '' OR toLower(b.name) CONTAINS $q OR toLower(dev.device_name) CONTAINS $q)
+                OPTIONAL MATCH (dev)-[:USES_METHOD]->(m:DetectionMethod)
+                RETURN b.name AS biomarker,
+                       dev.device_name AS device_name,
+                       dev.k_number AS k_number,
+                       dev.product_code AS product_code,
+                       m.name AS detection_method
+                LIMIT 500
+                """,
+                {"q": search_term.lower().strip()},
+            )
+            if dev_table:
+                st.caption(
+                    "Devices are pulled from the public FDA 510(k) API and mapped to generic detection methods."
                 )
-            if "disease_specimens" in df.columns:
-                df["disease_specimens"] = df["disease_specimens"].apply(
-                    lambda xs: ", ".join(sorted({x for x in xs if x})) if isinstance(xs, list) else ""
-                )
-
-            st.caption(f"Showing {len(df)} biomarker–disease edges (max 500).")
-            st.dataframe(df, use_container_width=True)
-
-
-# -----------------------------
-# Tab 2: Specimens
-# -----------------------------
-with tabs[1]:
-    st.subheader("Specimens linked to biomarkers and diseases")
-
-    if not q:
-        st.info("Enter a search term in the sidebar and click **Search** to explore specimens.")
-    else:
-        params = {"q": q.lower()}
-
-        q_disease_specimen = """
-        MATCH (d:Disease)-[:DETECTED_IN_SPECIMEN]->(s:Specimen)
-        WHERE toLower(d.name) CONTAINS $q
-        RETURN
-          d.name AS disease,
-          s.name AS specimen
-        ORDER BY disease, specimen
-        LIMIT 300
-        """
-        disease_rows = run_cypher(q_disease_specimen, params)
-        df_disease = pd.DataFrame(disease_rows)
-
-        q_biomarker_specimen = """
-        MATCH (b:Biomarker)-[:MEASURED_IN_SPECIMEN]->(s:Specimen)
-        WHERE toLower(b.name) CONTAINS $q
-        RETURN
-          b.name AS biomarker,
-          s.name AS specimen
-        ORDER BY biomarker, specimen
-        LIMIT 300
-        """
-        biomarker_rows = run_cypher(q_biomarker_specimen, params)
-        df_biomarker = pd.DataFrame(biomarker_rows)
-
-        cols = st.columns(2)
-
-        with cols[0]:
-            st.markdown("**Diseases → Specimens**")
-            if df_disease.empty:
-                st.caption("No disease–specimen matches for this term.")
+                st.dataframe(pd.DataFrame(dev_table))
             else:
-                st.caption(f"{len(df_disease)} disease–specimen pairs")
-                st.dataframe(df_disease, use_container_width=True)
+                st.info("No devices matched this search / filter.")
 
-        with cols[1]:
-            st.markdown("**Biomarkers → Specimens**")
-            if df_biomarker.empty:
-                st.caption("No biomarker–specimen matches for this term.")
-            else:
-                st.caption(f"{len(df_biomarker)} biomarker–specimen pairs")
-                st.dataframe(df_biomarker, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("#### All specimen types (for reference)")
-    all_specimen_rows = run_cypher(
-        "MATCH (s:Specimen) RETURN s.name AS specimen ORDER BY specimen LIMIT 200"
-    )
-    if all_specimen_rows:
-        df_all_spec = pd.DataFrame(all_specimen_rows)
-        st.dataframe(df_all_spec, use_container_width=True, height=260)
-    else:
-        st.caption("No Specimen nodes found.")
+    # end col_main
 
 
-# -----------------------------
-# Tab 3: Devices & Detection Methods
-# -----------------------------
-with tabs[2]:
-    st.subheader("FDA Devices & Detection Methods")
-
-    if not q:
-        st.info("Enter a search term in the sidebar and click **Search** to search devices and methods.")
-    else:
-        params = {"q": q.lower()}
-
-        q_devices = """
-        MATCH (d:Device)
-        WHERE
-          toLower(d.device_name) CONTAINS $q
-          OR toLower(coalesce(d.product_code, '')) CONTAINS $q
-          OR toLower(coalesce(d.k_number, '')) CONTAINS $q
-        OPTIONAL MATCH (d)-[:USES_METHOD]->(m:DetectionMethod)
-        RETURN
-          d.device_name AS device_name,
-          d.k_number AS k_number,
-          d.product_code AS product_code,
-          m.name AS detection_method
-        ORDER BY device_name
-        LIMIT 500
-        """
-        device_rows = run_cypher(q_devices, params)
-        df_devices = pd.DataFrame(device_rows)
-
-        q_methods = """
-        MATCH (m:DetectionMethod)
-        WHERE toLower(m.name) CONTAINS $q
-        OPTIONAL MATCH (d:Device)-[:USES_METHOD]->(m)
-        RETURN
-          m.name AS detection_method,
-          count(DISTINCT d) AS num_devices
-        ORDER BY num_devices DESC, detection_method
-        LIMIT 100
-        """
-        method_rows = run_cypher(q_methods, params)
-        df_methods = pd.DataFrame(method_rows)
-
-        cols = st.columns(2)
-
-        with cols[0]:
-            st.markdown("**Devices matching search term**")
-            if df_devices.empty:
-                st.caption("No devices matched this search term.")
-            else:
-                st.caption(f"{len(df_devices)} devices (max 500).")
-                st.dataframe(df_devices, use_container_width=True)
-
-        with cols[1]:
-            st.markdown("**Detection methods matching search term**")
-            if df_methods.empty:
-                st.caption("No detection methods matched this search term.")
-            else:
-                st.caption("Methods and how many devices use each one.")
-                st.dataframe(df_methods, use_container_width=True)
-
-    st.markdown(
-        """
-        _Note_: Devices are pulled from the public FDA 510(k) device API and
-        automatically mapped to generic detection methods (e.g., *Immunoassay*,
-        *Colorimetric*, *Fluorescence*).
-        """
-    )
+if __name__ == "__main__":
+    main()
